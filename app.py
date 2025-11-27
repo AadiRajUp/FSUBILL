@@ -1,106 +1,150 @@
-#### Written by FSU Automation Team
+#
+# Written and maintained by FSU
+#
+
 import base64
 import json
-from flask import Flask, render_template, request
+from typing import List, Dict
 import requests
-import fitz 
-from io import BytesIO
+import fitz
+from flask import Flask, request, render_template
+from werkzeug.datastructures import ImmutableMultiDict, FileStorage
 
+# ----------------------------------
+ENDPOINT = "https://api.pdfendpoint.com/v1/convert"
 app = Flask(__name__)
 app.secret_key = "##$$"
+# ----------------------------------
+
+
+def parse_table(table_json: str) -> List[List[str]]:
+    '''
+    returns parsed table row from table_json, empty if invalid
+    '''
+    try:
+        return json.loads(table_json)
+    except json.JSONDecodeError:
+        return list()
+
+
+def calculate_total(table_values: List[List[str]]) -> float:
+    '''
+    total price calculation at index 6
+    '''
+    return sum(float(row[5]) for row in table_values if len(row) > 5)
+
+
+def encode_files_to_base64(files: ImmutableMultiDict[str, FileStorage]) -> List[Dict[str, str]]:
+    '''
+    convert uploaded files to base64 with `metadata`
+    '''
+    encoded_files = list()
+    for file_key in files:
+        file = files[file_key]
+        file_bytes = file.read()
+        encoded_files.append({
+            "filename": file.filename,
+            "mime_type": file.mimetype,
+            "data": base64.b64encode(file_bytes).decode("utf-8")
+        })
+    return encoded_files
+
+
+def generate_pdf(html_content: str) -> str:
+    '''
+    using ENDPOINT generate pdf from html
+    '''
+    payload = {
+        "html": html_content,
+        "margin_top": "0cm",
+        "margin_bottom": "0cm",
+        "margin_right": "0cm",
+        "margin_left": "0cm",
+        "no_backgrounds": False,
+        "no_images": False,
+        "printBackground": True,
+        "sandbox": True
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer pdfe_live_e2386b010bda9ea889d9a1dc16cb9cd41076"
+    }
+    response = requests.post(ENDPOINT, json=payload, headers=headers)
+    response_data = response.json()
+    return response_data.get('data', {}).get('url', '')
+
+
+def pdf_first_page_to_base64(pdf_url: str) -> Dict[str, str]:
+    '''
+    convert from first page of pdf to base64-enc png image
+    '''
+    pdf_bytes = requests.get(pdf_url).content
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[0]
+    pix = page.get_pixmap(dpi=300)
+    img_bytes = pix.tobytes("png")
+    return {
+        "filename": "firstpage.png",
+        "mime_type": "image/png",
+        "data": base64.b64encode(img_bytes).decode("utf-8")
+    }
+
+
+def render_bill_template(
+    title: str,
+    date: str,
+    table_values: List[List[str]],
+    total: float,
+    pdf_url: str,
+    images_base64: List[Dict[str, str]]
+) -> str:
+    '''
+    render_template bill-new.html with necessary data
+    '''
+    return render_template(
+        'bill-new.html',
+        title=title,
+        date=date,
+        tableData=table_values,
+        total=total,
+        downloadLink=pdf_url,
+        images=images_base64
+    )
+
 
 @app.route('/')
-def index():
-    return render_template('Index.html') 
+def index() -> str:
+    return render_template("Index.html")
+
 
 @app.route('/generate-bill', methods=['POST'])
-def parlament():
-    '''cuz bill maker'''
-    if request.method == "POST":
-        title = request.form.get('title')
-        date = request.form.get('date')
-      
-        table_values = request.form['table'].split(",")
-        table_json = request.form.get('table')  # This is JSON string
+def generate_bill() -> str:
+    title = request.form.get('title', '')
+    date = request.form.get('date', '')
+    table_json = request.form.get('table', '[]')
 
-        table_values = json.loads(table_json)  
-        print(table_values)
-        list_of_lists = table_values
-        
-        total = sum([float(i[5]) for i in list_of_lists])
-        print(list_of_lists)
+    table_values = parse_table(table_json)
+    total = calculate_total(table_values)
+    images_base64 = encode_files_to_base64(request.files)
 
-        # image creation
-        images_base64 = []  # list of dicts {filename, mime_type, data}
-        for key in request.files:
-            file = request.files[key]
-            file_bytes = file.read()
-            encoded_str = base64.b64encode(file_bytes).decode("utf-8")
-            mime_type = file.mimetype  
-            images_base64.append({
-                "filename": file.filename,
-                "mime_type": mime_type,
-                "data": encoded_str
-            })
+    html_content = render_template(
+        'bill-new.html',
+        title=title,
+        date=date,
+        tableData=table_values,
+        total=total,
+        downloadLink="",
+        downloadName="",
+        images=images_base64
+    )
 
-        url = "https://api.pdfendpoint.com/v1/convert"
-        
-        rd = render_template(
-            'bill-new.html',
-            title=title,
-            date=date,
-            tableData=list_of_lists,
-            total=total,
-            downloadLink="",
-            downloadName="",
-            images=images_base64
-        )
-        
-        payload = {
-            "html": rd,
-            "margin_top": "0cm",
-            "margin_bottom": "0cm",
-            "margin_right": "0cm",
-            "margin_left": "0cm",
-            "no_backgrounds": False,
-            "no_images":False,
-            "printBackground":True,
-            'sandbox':True
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": "Bearer pdfe_live_e2386b010bda9ea889d9a1dc16cb9cd41076"
-        }
-        
-        response = requests.request("POST", url, json=payload, headers=headers)
-        print(response.json())
-     
-        aa = (response.json()['data']['url'])
+    pdf_url = generate_pdf(html_content)
 
-        data_pdf = requests.get(aa)
-        doc = fitz.open(stream=data_pdf.content, filetype="pdf")
-        page = doc[0]  # first page
-        pix = page.get_pixmap(dpi=300)
+    if pdf_url:
+        images_base64.append(pdf_first_page_to_base64(pdf_url))
 
-        img_bytes = pix.tobytes("png")   # raw PNG bytes
-        img_io = BytesIO(img_bytes)      # wrap in BytesIO if needed
+    return render_bill_template(title, date, table_values, total, pdf_url, images_base64)
 
-        encoded_str = base64.b64encode(img_bytes).decode("utf-8")
-        images_base64.append({
-            "filename": 'firstpage.png',
-            "mime_type": 'image/png',
-            "data": encoded_str
-        })
 
-        return render_template(
-            'bill-new.html',
-            title=title,
-            date=date,
-            tableData=list_of_lists,
-            total=total,
-            downloadLink=aa,
-            downloadName="Download? Zoom out if you can't see complete table!.\nScroll Below to see your images and press it to download (your first page picture is also there)",
-            images=images_base64
-        )
-if __name__ == '__main__':
-    app.run(debug=True)
+if __name__ == "__main__":
+    app.run(debug=False)
